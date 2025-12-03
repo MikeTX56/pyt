@@ -39,10 +39,16 @@ def get_column_values(data, column_name, convert_type=None):
 
     Returns:
         List of values from the specified column
+
+    Raises:
+        ValueError: If type conversion fails for any value
     """
     values = [row[column_name] for row in data]
     if convert_type:
-        values = [convert_type(v) for v in values]
+        try:
+            values = [convert_type(v) for v in values]
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"Failed to convert values in column '{column_name}': {e}")
     return values
 
 
@@ -162,6 +168,14 @@ def create_histogram(values, bins=5, width=40):
 
     min_val = min(values)
     max_val = max(values)
+
+    # Handle edge case where all values are identical
+    if max_val == min_val:
+        print("\nHistogram:")
+        bar = "█" * width
+        print(f"  {min_val:8.1f}           | {bar} ({len(values)})")
+        return
+
     bin_width = (max_val - min_val) / bins
 
     # Count values in each bin

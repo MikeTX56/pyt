@@ -1,426 +1,488 @@
-        TITLE   High-Speed Data Transfer System Using Intel 8257 DMA Controller
 ; ============================================================
-; FILE    : dma_transfer.asm
-; TITLE   : High-Speed Data Transfer System – Intel 8257 + 8086
-; PROCESSOR: Intel 8086
-; ASSEMBLER: MASM 5.x / TASM 3.x compatible
+; FILE      : dma_transfer.asm
+; TITLE     : High-Speed Data Transfer System
+;             Intel 8257 DMA Controller + Intel 8086
+; ASSEMBLER : emu8086  (also works with MASM 5.x / TASM 3.x)
 ;
-; DESCRIPTION:
-;   Demonstrates four DMA transfer modes using the Intel 8257
-;   Programmable DMA Controller interfaced to an 8086 CPU:
+; HOW TO RUN IN emu8086
+;   1. Open emu8086, click "New", paste this entire file.
+;   2. Click "Emulate", then "Run".
+;   3. The console window shows all 4 demo results.
 ;
-;     1. Block Transfer      – Channel 0 (CH0)
-;        DMA holds the bus for the entire 256-byte block.
+; HOW TO RUN IN VS CODE (8086 Microprocessor Simulator extension)
+;   1. Open this single file in VS Code.
+;   2. Press F5 (or use the Run button in the extension).
 ;
-;     2. Demand-Mode Transfer – Channel 1 (CH1)
-;        DMA transfers while DREQ is asserted; CPU regains bus
-;        only when DREQ is de-asserted.
+; NOTE: This file is fully self-contained – no INCLUDE needed.
 ;
-;     3. Single-Byte Transfer – Channel 2 (CH2)
-;        One byte per DMA cycle; CPU gets the bus between bytes.
+; ============================================================
+; Intel 8257 I/O PORT MAP
+; ============================================================
+;  Port  Register
+;  00H   CH0 Address  (write low byte, then high byte)
+;  01H   CH0 Count    (write low byte, then high byte)
+;  02H   CH1 Address
+;  03H   CH1 Count
+;  04H   CH2 Address
+;  05H   CH2 Count
+;  06H   CH3 Address
+;  07H   CH3 Count
+;  08H   Mode Register (WRITE) / Status Register (READ)
 ;
-;     4. Memory-to-Memory    – Channels 0 → 1 (mode bit 7)
-;        On-chip move without CPU involvement in data path.
+; ============================================================
+; MODE SET REGISTER (write port 08H)
+; ============================================================
+;  Bit 7 : MEMTOMEM  – Memory-to-memory enable (CH0 -> CH1)
+;  Bit 6 : AUTOLOAD  – Auto-load on TC
+;  Bit 5 : EXWRITE   – Extended write select
+;  Bit 4 : ROTATPRI  – Rotating priority
+;  Bit 3 : CH3_EN    – Enable Channel 3
+;  Bit 2 : CH2_EN    – Enable Channel 2
+;  Bit 1 : CH1_EN    – Enable Channel 1
+;  Bit 0 : CH0_EN    – Enable Channel 0
 ;
-; I/O PORT MAP  (see intel8257.inc for full register list)
-;   DMA_CH0_ADDR  = 00H   DMA_CH0_COUNT = 01H
-;   DMA_CH1_ADDR  = 02H   DMA_CH1_COUNT = 03H
-;   DMA_CH2_ADDR  = 04H   DMA_CH2_COUNT = 05H
-;   DMA_CH3_ADDR  = 06H   DMA_CH3_COUNT = 07H
-;   DMA_MODE_REG  = 08H   (write = mode set, read = status)
+; ============================================================
+; STATUS REGISTER (read port 08H – clears on read)
+; ============================================================
+;  Bit 3 : CH3 Terminal Count reached
+;  Bit 2 : CH2 Terminal Count reached
+;  Bit 1 : CH1 Terminal Count reached
+;  Bit 0 : CH0 Terminal Count reached
 ;
-; MEMORY MAP
-;   0200H – 02FFH  SOURCE_BUF  (256 bytes – source data)
-;   0300H – 03FFH  DEST_BUF    (256 bytes – destination)
-;   0400H – 04FFH  SCRATCH_BUF (256 bytes – scratch/verify)
-;
-; REGISTERS USED ACROSS PROCEDURES
-;   BX – base address of DMA channel
-;   CX – byte count
-;   SI – source pointer (string ops)
-;   DI – destination pointer (string ops)
-;   AL – data / port value
+; ============================================================
+; FOUR DEMOS (all output to the same console window)
+; ============================================================
+;  Demo 1 – Block Transfer      (Channel 0)
+;  Demo 2 – Demand-Mode Transfer(Channel 1)
+;  Demo 3 – Single-Byte Transfer(Channel 2)
+;  Demo 4 – Memory-to-Memory    (CH0 -> CH1)
 ; ============================================================
 
-        INCLUDE intel8257.inc
+; ------ 8257 port addresses --------------------------------
+DMA_CH0_ADDR    EQU  00H
+DMA_CH0_COUNT   EQU  01H
+DMA_CH1_ADDR    EQU  02H
+DMA_CH1_COUNT   EQU  03H
+DMA_CH2_ADDR    EQU  04H
+DMA_CH2_COUNT   EQU  05H
+DMA_CH3_ADDR    EQU  06H
+DMA_CH3_COUNT   EQU  07H
+DMA_MODE_REG    EQU  08H
 
-; ============================================================
-; STACK SEGMENT
-; ============================================================
-STACK_SEG SEGMENT PARA STACK 'STACK'
-        DB      100H DUP (?)
-STACK_SEG ENDS
+; ------ Mode register channel-enable bits ------------------
+DMA_CH0_EN      EQU  01H        ; bit 0
+DMA_CH1_EN      EQU  02H        ; bit 1
+DMA_CH2_EN      EQU  04H        ; bit 2
+DMA_CH3_EN      EQU  08H        ; bit 3
+DMA_MEM2MEM     EQU  80H        ; bit 7 – memory-to-memory
 
-; ============================================================
-; DATA SEGMENT
-; ============================================================
-DATA_SEG SEGMENT PARA 'DATA'
+; ------ Status register TC flags ---------------------------
+DMA_ST_CH0_TC   EQU  01H
+DMA_ST_CH1_TC   EQU  02H
+DMA_ST_CH2_TC   EQU  04H
+DMA_ST_CH3_TC   EQU  08H
 
-SOURCE_BUF      DB      256 DUP (?)     ; source data buffer
-DEST_BUF        DB      256 DUP (?)     ; DMA destination buffer
-SCRATCH_BUF     DB      256 DUP (?)     ; scratch buffer (mem-to-mem)
+; ------ Transfer block size --------------------------------
+BLOCK_SIZE      EQU  0100H      ; 256 bytes
 
-; Status and message strings (DOS INT 21H / AH=09H)
-MSG_BLOCK_OK    DB      'Block Transfer   : OK', 0DH, 0AH, '$'
-MSG_BLOCK_FAIL  DB      'Block Transfer   : FAIL', 0DH, 0AH, '$'
-MSG_DEMAND_OK   DB      'Demand Transfer  : OK', 0DH, 0AH, '$'
-MSG_DEMAND_FAIL DB      'Demand Transfer  : FAIL', 0DH, 0AH, '$'
-MSG_SINGLE_OK   DB      'Single Transfer  : OK', 0DH, 0AH, '$'
-MSG_SINGLE_FAIL DB      'Single Transfer  : FAIL', 0DH, 0AH, '$'
-MSG_MEM2MEM_OK  DB      'Mem-to-Mem       : OK', 0DH, 0AH, '$'
-MSG_MEM2MEM_FAIL DB     'Mem-to-Mem       : FAIL', 0DH, 0AH, '$'
-MSG_DONE        DB      0DH, 0AH, 'All DMA demos complete.', 0DH, 0AH, '$'
+; ===========================================================
+.MODEL SMALL
+.STACK 0200H
 
-DATA_SEG ENDS
+.DATA
 
-; ============================================================
-; CODE SEGMENT
-; ============================================================
-CODE_SEG SEGMENT PARA 'CODE'
-        ASSUME  CS:CODE_SEG, DS:DATA_SEG, SS:STACK_SEG
+SOURCE_BUF  DB  256 DUP(0)      ; source data (filled 00H..FFH)
+DEST_BUF    DB  256 DUP(0)      ; destination for demos 1-3
+SCRATCH_BUF DB  256 DUP(0)      ; destination for demo 4
 
-; ------------------------------------------------------------
-; PROCEDURE: MAIN
-; Entry point.  Initialises segments, fills source buffer with
-; a known pattern, then runs each transfer demo in order.
-; ------------------------------------------------------------
-MAIN    PROC    FAR
+; ---- section headers (printed before each demo) -----------
+HDR1  DB  '--- Demo 1: Block Transfer (CH0) ---', 0DH, 0AH, '$'
+HDR2  DB  '--- Demo 2: Demand-Mode   (CH1) ---', 0DH, 0AH, '$'
+HDR3  DB  '--- Demo 3: Single-Byte   (CH2) ---', 0DH, 0AH, '$'
+HDR4  DB  '--- Demo 4: Mem-to-Mem (CH0->CH1)---', 0DH, 0AH, '$'
 
-        ; Initialise data segment
-        MOV     AX, DATA_SEG
-        MOV     DS, AX
+; ---- result messages --------------------------------------
+MSG_BLOCK_OK    DB  'Block Transfer   : OK',   0DH, 0AH, '$'
+MSG_BLOCK_FAIL  DB  'Block Transfer   : FAIL', 0DH, 0AH, '$'
+MSG_DEMAND_OK   DB  'Demand Transfer  : OK',   0DH, 0AH, '$'
+MSG_DEMAND_FAIL DB  'Demand Transfer  : FAIL', 0DH, 0AH, '$'
+MSG_SINGLE_OK   DB  'Single Transfer  : OK',   0DH, 0AH, '$'
+MSG_SINGLE_FAIL DB  'Single Transfer  : FAIL', 0DH, 0AH, '$'
+MSG_M2M_OK      DB  'Mem-to-Mem       : OK',   0DH, 0AH, '$'
+MSG_M2M_FAIL    DB  'Mem-to-Mem       : FAIL', 0DH, 0AH, '$'
+MSG_DONE        DB  0DH, 0AH, 'All 4 DMA demos complete.', 0DH, 0AH, '$'
+MSG_NEWLINE     DB  0DH, 0AH, '$'
 
-        ; Initialise the 8257 DMA controller (disable all channels,
-        ; clear internal flip-flop, reset CH0 registers)
-        CALL    INIT_DMA
+.CODE
 
-        ; Fill SOURCE_BUF with a known pattern (00H..FFH)
-        CALL    FILL_SOURCE
+; ===========================================================
+; MAIN – entry point
+; ===========================================================
+MAIN PROC
+        MOV  AX, @DATA
+        MOV  DS, AX
 
-        ; 1. Block transfer (Channel 0)
-        CALL    DEMO_BLOCK
+        CALL INIT_DMA           ; reset 8257, disable all channels
+        CALL FILL_SOURCE        ; load 00H..FFH into SOURCE_BUF
 
-        ; 2. Demand-mode transfer (Channel 1)
-        CALL    DEMO_DEMAND
+        CALL DEMO_BLOCK         ; Demo 1
+        CALL DEMO_DEMAND        ; Demo 2
+        CALL DEMO_SINGLE        ; Demo 3
+        CALL DEMO_MEM2MEM       ; Demo 4
 
-        ; 3. Single-byte transfer (Channel 2)
-        CALL    DEMO_SINGLE
+        LEA  DX, MSG_DONE
+        MOV  AH, 09H
+        INT  21H
 
-        ; 4. Memory-to-memory (CH0 → CH1 using SCRATCH_BUF)
-        CALL    DEMO_MEM2MEM
+        MOV  AX, 4C00H
+        INT  21H
+MAIN ENDP
 
-        ; Print final message and exit to DOS
-        LEA     DX, MSG_DONE
-        MOV     AH, 09H
-        INT     21H
-
-        MOV     AX, 4C00H
-        INT     21H
-
-MAIN    ENDP
-
-; ============================================================
-; PROCEDURE: FILL_SOURCE
-; Fills SOURCE_BUF with values 00H, 01H, ..., FFH so every
-; demo starts with a deterministic, verifiable data set.
-;
-; Destroys: AX, CX, DI
-; ============================================================
-FILL_SOURCE PROC NEAR
-        LEA     DI, SOURCE_BUF
-        XOR     AL, AL          ; start value = 00H
-        MOV     CX, BLOCK_SIZE  ; 256 bytes
-FILL_LOOP:
-        MOV     [DI], AL
-        INC     DI
-        INC     AL
-        LOOP    FILL_LOOP
-        RET
-FILL_SOURCE ENDP
-
-; ============================================================
-; PROCEDURE: DEMO_BLOCK
-; Demonstrates a full block-mode DMA transfer on Channel 0.
-;
-; The 8257 asserts HRQ and holds the 8086 bus for the entire
-; 256-byte block without releasing it between bytes.
-;
-; Source      : SOURCE_BUF (offset in DS)
-; Destination : DEST_BUF   (offset in DS)
-; Channel     : 0
-; Count       : 256 bytes
-; ============================================================
-DEMO_BLOCK  PROC NEAR
-
-        ; ---- Reset the 8257 ----
-        DMA_RESET
-
-        ; ---- Program CH0 address ----
-        ; BX = physical offset of SOURCE_BUF
-        LEA     BX, SOURCE_BUF
-        DMA_WRITE_ADDR  DMA_CH0_ADDR
-
-        ; ---- Program CH0 word count ----
-        ; CX = number of bytes to transfer
-        MOV     CX, BLOCK_SIZE
-        DMA_WRITE_COUNT DMA_CH0_COUNT
-
-        ; ---- Enable CH0, read mode (memory read) ----
-        DMA_ENABLE  DMA_CH0_EN
-
-        ; ---- Wait for Terminal Count on CH0 ----
-        WAIT_TC DMA_ST_CH0_TC
-
-        ; ---- Copy destination from DMA output ----
-        ; (In a real system the 8257 drives the address bus directly;
-        ;  here we use MOVSB to model the memory write to DEST_BUF.)
-        LEA     SI, SOURCE_BUF
-        LEA     DI, DEST_BUF
-        MOV     CX, BLOCK_SIZE
-        CLD
-        REP     MOVSB
-
-        ; ---- Verify and print result ----
-        CALL    VERIFY_DEST
-        JNC     BLOCK_PASS
-        LEA     DX, MSG_BLOCK_FAIL
-        JMP     BLOCK_PRINT
-BLOCK_PASS:
-        LEA     DX, MSG_BLOCK_OK
-BLOCK_PRINT:
-        MOV     AH, 09H
-        INT     21H
-        RET
-
-DEMO_BLOCK  ENDP
-
-; ============================================================
-; PROCEDURE: DEMO_DEMAND
-; Demonstrates demand-mode DMA transfer on Channel 1.
-;
-; In demand mode the 8257 transfers bytes as long as DREQ is
-; asserted.  The CPU bus is released only when DREQ drops.
-;
-; Source      : SOURCE_BUF
-; Destination : DEST_BUF
-; Channel     : 1
-; Count       : 256 bytes
-; ============================================================
-DEMO_DEMAND PROC NEAR
-
-        ; ---- Reset the 8257 ----
-        DMA_RESET
-
-        ; ---- Program CH1 address with source offset ----
-        LEA     BX, SOURCE_BUF
-        DMA_WRITE_ADDR  DMA_CH1_ADDR
-
-        ; ---- Program CH1 word count ----
-        MOV     CX, BLOCK_SIZE
-        DMA_WRITE_COUNT DMA_CH1_COUNT
-
-        ; ---- Enable CH1 ----
-        DMA_ENABLE  DMA_CH1_EN
-
-        ; ---- Wait for CH1 Terminal Count ----
-        WAIT_TC DMA_ST_CH1_TC
-
-        ; ---- Model the memory write (demand burst) ----
-        LEA     SI, SOURCE_BUF
-        LEA     DI, DEST_BUF
-        MOV     CX, BLOCK_SIZE
-        CLD
-        REP     MOVSB
-
-        ; ---- Verify and print result ----
-        CALL    VERIFY_DEST
-        JNC     DEMAND_PASS
-        LEA     DX, MSG_DEMAND_FAIL
-        JMP     DEMAND_PRINT
-DEMAND_PASS:
-        LEA     DX, MSG_DEMAND_OK
-DEMAND_PRINT:
-        MOV     AH, 09H
-        INT     21H
-        RET
-
-DEMO_DEMAND ENDP
-
-; ============================================================
-; PROCEDURE: DEMO_SINGLE
-; Demonstrates single-byte DMA transfer on Channel 2.
-;
-; The 8257 transfers one byte per DMA request cycle and then
-; releases the bus back to the 8086 before the next byte.
-; This loop explicitly re-asserts DREQ for every byte by
-; re-enabling Channel 2 in the mode register.
-;
-; Source      : SOURCE_BUF
-; Destination : DEST_BUF
-; Channel     : 2
-; Count       : 256 bytes
-; ============================================================
-DEMO_SINGLE PROC NEAR
-
-        ; ---- Reset the 8257 ----
-        DMA_RESET
-
-        ; ---- Program CH2 address ----
-        LEA     BX, SOURCE_BUF
-        DMA_WRITE_ADDR  DMA_CH2_ADDR
-
-        ; ---- Program CH2 word count ----
-        MOV     CX, BLOCK_SIZE
-        DMA_WRITE_COUNT DMA_CH2_COUNT
-
-        ; ---- Single-byte loop: one DREQ per byte ----
-        ; SI = source pointer, DI = destination pointer
-        LEA     SI, SOURCE_BUF
-        LEA     DI, DEST_BUF
-        MOV     CX, BLOCK_SIZE
-        CLD
-
-SINGLE_LOOP:
-        ; Assert DREQ by enabling CH2 for this byte
-        DMA_ENABLE  DMA_CH2_EN
-
-        ; Transfer one byte (models MEMR + MEMW on the bus)
-        MOVSB
-
-        ; Release bus: disable channel after single byte
-        DMA_RESET
-
-        ; Check TC after last byte
-        DMA_READ_STATUS
-        TEST    AL, DMA_ST_CH2_TC
-        JNZ     SINGLE_DONE
-
-        LOOP    SINGLE_LOOP
-
-SINGLE_DONE:
-        ; ---- Verify and print result ----
-        CALL    VERIFY_DEST
-        JNC     SINGLE_PASS
-        LEA     DX, MSG_SINGLE_FAIL
-        JMP     SINGLE_PRINT
-SINGLE_PASS:
-        LEA     DX, MSG_SINGLE_OK
-SINGLE_PRINT:
-        MOV     AH, 09H
-        INT     21H
-        RET
-
-DEMO_SINGLE ENDP
-
-; ============================================================
-; PROCEDURE: DEMO_MEM2MEM
-; Demonstrates memory-to-memory DMA using CH0 (source) and
-; CH1 (destination) with mode bit 7 set.
-;
-; Source      : SOURCE_BUF
-; Destination : SCRATCH_BUF
-; Channels    : 0 (read) and 1 (write)
-; Count       : 256 bytes
-; ============================================================
-DEMO_MEM2MEM PROC NEAR
-
-        ; ---- Reset the 8257 ----
-        DMA_RESET
-
-        ; ---- Program CH0 with source address ----
-        LEA     BX, SOURCE_BUF
-        DMA_WRITE_ADDR  DMA_CH0_ADDR
-
-        MOV     CX, BLOCK_SIZE
-        DMA_WRITE_COUNT DMA_CH0_COUNT
-
-        ; ---- Program CH1 with destination address ----
-        LEA     BX, SCRATCH_BUF
-        DMA_WRITE_ADDR  DMA_CH1_ADDR
-
-        MOV     CX, BLOCK_SIZE
-        DMA_WRITE_COUNT DMA_CH1_COUNT
-
-        ; ---- Enable memory-to-memory mode + CH0 + CH1 ----
-        DMA_ENABLE  DMA_MEM2MEM OR DMA_CH0_EN OR DMA_CH1_EN
-
-        ; ---- Wait for both CH0 and CH1 TC ----
-        WAIT_TC DMA_ST_CH0_TC OR DMA_ST_CH1_TC
-
-        ; ---- Model the memory copy (CH0 → CH1) ----
-        LEA     SI, SOURCE_BUF
-        LEA     DI, SCRATCH_BUF
-        MOV     CX, BLOCK_SIZE
-        CLD
-        REP     MOVSB
-
-        ; ---- Verify SCRATCH_BUF matches SOURCE_BUF ----
-        LEA     SI, SOURCE_BUF
-        LEA     DI, SCRATCH_BUF
-        MOV     CX, BLOCK_SIZE
-        CLD
-        REPE    CMPSB
-        JNZ     M2M_FAIL
-
-        LEA     DX, MSG_MEM2MEM_OK
-        JMP     M2M_PRINT
-M2M_FAIL:
-        LEA     DX, MSG_MEM2MEM_FAIL
-M2M_PRINT:
-        MOV     AH, 09H
-        INT     21H
-        RET
-
-DEMO_MEM2MEM ENDP
-
-; ============================================================
-; PROCEDURE: VERIFY_DEST
-; Compares SOURCE_BUF and DEST_BUF byte-by-byte.
-;
-; Returns : CF = 0  if buffers match (success)
-;           CF = 1  if any byte differs (failure)
-;
-; Destroys: AX, CX, SI, DI, flags
-; ============================================================
-VERIFY_DEST PROC NEAR
-        LEA     SI, SOURCE_BUF
-        LEA     DI, DEST_BUF
-        MOV     CX, BLOCK_SIZE
-        CLD
-        REPE    CMPSB
-        JNZ     VERIFY_FAIL
-        CLC                     ; CF = 0 → success
-        RET
-VERIFY_FAIL:
-        STC                     ; CF = 1 → failure
-        RET
-VERIFY_DEST ENDP
-
-; ============================================================
-; PROCEDURE: INIT_DMA
-; Full 8257 initialisation sequence:
-;   1. Disable all channels (master reset via mode register)
-;   2. Clear the internal flip-flop
-;   3. Program CH0 with a safe default (address 0000H, count 0)
-;
-; Call this once at power-on before any transfer procedure.
+; ===========================================================
+; INIT_DMA
+; Resets the Intel 8257: disables all channels, clears the
+; internal address/count flip-flop, zeroes CH0 registers.
 ; Destroys: AL
-; ============================================================
+; ===========================================================
 INIT_DMA PROC NEAR
-        ; Disable all channels
-        DMA_RESET
+        ; --- disable all channels (mode register = 00H) ----
+        MOV  AL, 00H
+        OUT  DMA_MODE_REG, AL
 
-        ; Clear flip-flop: writing 00H twice programs address 0000H
-        XOR     AL, AL
-        OUT     DMA_CH0_ADDR, AL
-        OUT     DMA_CH0_ADDR, AL
-
-        ; Zero CH0 count
-        OUT     DMA_CH0_COUNT, AL
-        OUT     DMA_CH0_COUNT, AL
+        ; --- clear flip-flop by writing 00H twice to CH0 ---
+        XOR  AL, AL
+        OUT  DMA_CH0_ADDR,  AL   ; flip-flop -> low byte
+        OUT  DMA_CH0_ADDR,  AL   ; flip-flop -> high byte (= 0000H)
+        OUT  DMA_CH0_COUNT, AL   ; count low  = 00H
+        OUT  DMA_CH0_COUNT, AL   ; count high = 00H
         RET
 INIT_DMA ENDP
 
-CODE_SEG ENDS
+; ===========================================================
+; FILL_SOURCE
+; Writes 00H, 01H, 02H, ..., FFH into SOURCE_BUF (256 bytes).
+; Destroys: AL, CX, DI
+; ===========================================================
+FILL_SOURCE PROC NEAR
+        LEA  DI, SOURCE_BUF
+        XOR  AL, AL
+        MOV  CX, BLOCK_SIZE
+FILL_LP:
+        MOV  [DI], AL
+        INC  DI
+        INC  AL
+        LOOP FILL_LP
+        RET
+FILL_SOURCE ENDP
 
-        END     MAIN
+; ===========================================================
+; DEMO 1 – BLOCK TRANSFER  (Channel 0)
+; ----------------------------------------------------------
+; In block mode the 8257 asserts HRQ and holds the 8086 bus
+; for the entire block without releasing it between bytes.
+;
+; Programming sequence (OUT instructions):
+;   1. Reset 8257 (mode reg = 00H)
+;   2. Write CH0 address: low byte then high byte -> port 00H
+;   3. Write CH0 count  : (n-1) low then high    -> port 01H
+;   4. Enable CH0 (mode reg = 01H)
+;   [Hardware then drives the bus; here MOVSB models the copy]
+;   5. Verify and print result
+; ===========================================================
+DEMO_BLOCK PROC NEAR
+        ; ---- print section header ----
+        LEA  DX, HDR1
+        MOV  AH, 09H
+        INT  21H
+
+        ; ---- 1. Reset 8257 ----
+        MOV  AL, 00H
+        OUT  DMA_MODE_REG, AL
+
+        ; ---- 2. Program CH0 address (SOURCE_BUF offset) ----
+        LEA  BX, SOURCE_BUF
+        MOV  AL, BL              ; low byte of address
+        OUT  DMA_CH0_ADDR, AL
+        MOV  AL, BH              ; high byte of address
+        OUT  DMA_CH0_ADDR, AL
+
+        ; ---- 3. Program CH0 word count (BLOCK_SIZE - 1) ----
+        MOV  AX, BLOCK_SIZE
+        DEC  AX                  ; 8257 stores (count - 1)
+        OUT  DMA_CH0_COUNT, AL   ; low byte  (FFH)
+        MOV  AL, AH
+        OUT  DMA_CH0_COUNT, AL   ; high byte (00H)
+
+        ; ---- 4. Enable CH0 (bit 0 = 1) ----
+        MOV  AL, DMA_CH0_EN
+        OUT  DMA_MODE_REG, AL
+
+        ; ---- 5. Simulate DMA data copy (MOVSB models bus transfer) ----
+        LEA  SI, SOURCE_BUF
+        LEA  DI, DEST_BUF
+        MOV  CX, BLOCK_SIZE
+        CLD
+        REP  MOVSB
+
+        ; ---- 6. Verify DEST_BUF == SOURCE_BUF ----
+        CALL VERIFY_DEST
+        JNC  BLK_OK
+        LEA  DX, MSG_BLOCK_FAIL
+        JMP  BLK_PRINT
+BLK_OK:
+        LEA  DX, MSG_BLOCK_OK
+BLK_PRINT:
+        MOV  AH, 09H
+        INT  21H
+        LEA  DX, MSG_NEWLINE
+        MOV  AH, 09H
+        INT  21H
+        RET
+DEMO_BLOCK ENDP
+
+; ===========================================================
+; DEMO 2 – DEMAND-MODE TRANSFER  (Channel 1)
+; ----------------------------------------------------------
+; In demand mode the 8257 transfers bytes continuously as
+; long as DREQ stays asserted.  The CPU bus is only returned
+; when DREQ is de-asserted (e.g. peripheral FIFO full).
+;
+; Programming sequence:
+;   1. Reset 8257
+;   2. Write CH1 address -> port 02H
+;   3. Write CH1 count   -> port 03H
+;   4. Enable CH1 (mode reg = 02H)
+;   [DMA bursts until TC; MOVSB models the continuous copy]
+; ===========================================================
+DEMO_DEMAND PROC NEAR
+        ; ---- print section header ----
+        LEA  DX, HDR2
+        MOV  AH, 09H
+        INT  21H
+
+        ; ---- 1. Reset 8257 ----
+        MOV  AL, 00H
+        OUT  DMA_MODE_REG, AL
+
+        ; ---- 2. Program CH1 address ----
+        LEA  BX, SOURCE_BUF
+        MOV  AL, BL
+        OUT  DMA_CH1_ADDR, AL
+        MOV  AL, BH
+        OUT  DMA_CH1_ADDR, AL
+
+        ; ---- 3. Program CH1 count ----
+        MOV  AX, BLOCK_SIZE
+        DEC  AX
+        OUT  DMA_CH1_COUNT, AL
+        MOV  AL, AH
+        OUT  DMA_CH1_COUNT, AL
+
+        ; ---- 4. Enable CH1 (bit 1 = 1) ----
+        MOV  AL, DMA_CH1_EN
+        OUT  DMA_MODE_REG, AL
+
+        ; ---- 5. Simulate demand-mode burst copy ----
+        LEA  SI, SOURCE_BUF
+        LEA  DI, DEST_BUF
+        MOV  CX, BLOCK_SIZE
+        CLD
+        REP  MOVSB
+
+        ; ---- 6. Verify ----
+        CALL VERIFY_DEST
+        JNC  DEM_OK
+        LEA  DX, MSG_DEMAND_FAIL
+        JMP  DEM_PRINT
+DEM_OK:
+        LEA  DX, MSG_DEMAND_OK
+DEM_PRINT:
+        MOV  AH, 09H
+        INT  21H
+        LEA  DX, MSG_NEWLINE
+        MOV  AH, 09H
+        INT  21H
+        RET
+DEMO_DEMAND ENDP
+
+; ===========================================================
+; DEMO 3 – SINGLE-BYTE TRANSFER  (Channel 2)
+; ----------------------------------------------------------
+; In single-byte mode the 8257 performs one bus transfer per
+; DREQ pulse, then releases the bus back to the 8086 before
+; the next byte.  Each byte requires a new DREQ assertion.
+;
+; Programming sequence:
+;   1. Reset 8257
+;   2. Write CH2 address -> port 04H
+;   3. Write CH2 count   -> port 05H
+;   4. Loop 256 times:
+;        a. Enable CH2 (assert DREQ for one byte)
+;        b. Transfer one byte (MOVSB)
+;        c. Disable CH2 (bus returned to CPU)
+; ===========================================================
+DEMO_SINGLE PROC NEAR
+        ; ---- print section header ----
+        LEA  DX, HDR3
+        MOV  AH, 09H
+        INT  21H
+
+        ; ---- 1. Reset 8257 ----
+        MOV  AL, 00H
+        OUT  DMA_MODE_REG, AL
+
+        ; ---- 2. Program CH2 address ----
+        LEA  BX, SOURCE_BUF
+        MOV  AL, BL
+        OUT  DMA_CH2_ADDR, AL
+        MOV  AL, BH
+        OUT  DMA_CH2_ADDR, AL
+
+        ; ---- 3. Program CH2 count ----
+        MOV  AX, BLOCK_SIZE
+        DEC  AX
+        OUT  DMA_CH2_COUNT, AL
+        MOV  AL, AH
+        OUT  DMA_CH2_COUNT, AL
+
+        ; ---- 4. Single-byte loop ----
+        LEA  SI, SOURCE_BUF
+        LEA  DI, DEST_BUF
+        MOV  CX, BLOCK_SIZE
+        CLD
+
+SLOOP:
+        MOV  AL, DMA_CH2_EN      ; assert DREQ: enable CH2
+        OUT  DMA_MODE_REG, AL
+        MOVSB                    ; one bus transfer (MEMR + MEMW)
+        MOV  AL, 00H             ; de-assert DREQ: disable all
+        OUT  DMA_MODE_REG, AL
+        LOOP SLOOP
+
+        ; ---- 5. Verify ----
+        CALL VERIFY_DEST
+        JNC  SNG_OK
+        LEA  DX, MSG_SINGLE_FAIL
+        JMP  SNG_PRINT
+SNG_OK:
+        LEA  DX, MSG_SINGLE_OK
+SNG_PRINT:
+        MOV  AH, 09H
+        INT  21H
+        LEA  DX, MSG_NEWLINE
+        MOV  AH, 09H
+        INT  21H
+        RET
+DEMO_SINGLE ENDP
+
+; ===========================================================
+; DEMO 4 – MEMORY-TO-MEMORY TRANSFER  (CH0 -> CH1)
+; ----------------------------------------------------------
+; Setting bit 7 of the mode register enables the 8257's
+; built-in memory-to-memory path: CH0 reads the source,
+; CH1 writes the destination – no I/O device involved.
+;
+; Mode byte = 80H (MEMTOMEM) | 01H (CH0_EN) | 02H (CH1_EN)
+;           = 83H
+;
+; Programming sequence:
+;   1. Reset 8257
+;   2. Write CH0 address (source)       -> port 00H
+;   3. Write CH0 count                  -> port 01H
+;   4. Write CH1 address (destination)  -> port 02H
+;   5. Write CH1 count                  -> port 03H
+;   6. Write mode = 83H                 -> port 08H
+;   [MOVSB models the on-chip DMA copy]
+; ===========================================================
+DEMO_MEM2MEM PROC NEAR
+        ; ---- print section header ----
+        LEA  DX, HDR4
+        MOV  AH, 09H
+        INT  21H
+
+        ; ---- 1. Reset 8257 ----
+        MOV  AL, 00H
+        OUT  DMA_MODE_REG, AL
+
+        ; ---- 2. CH0 address = SOURCE_BUF ----
+        LEA  BX, SOURCE_BUF
+        MOV  AL, BL
+        OUT  DMA_CH0_ADDR, AL
+        MOV  AL, BH
+        OUT  DMA_CH0_ADDR, AL
+
+        ; ---- 3. CH0 count ----
+        MOV  AX, BLOCK_SIZE
+        DEC  AX
+        OUT  DMA_CH0_COUNT, AL
+        MOV  AL, AH
+        OUT  DMA_CH0_COUNT, AL
+
+        ; ---- 4. CH1 address = SCRATCH_BUF ----
+        LEA  BX, SCRATCH_BUF
+        MOV  AL, BL
+        OUT  DMA_CH1_ADDR, AL
+        MOV  AL, BH
+        OUT  DMA_CH1_ADDR, AL
+
+        ; ---- 5. CH1 count ----
+        MOV  AX, BLOCK_SIZE
+        DEC  AX
+        OUT  DMA_CH1_COUNT, AL
+        MOV  AL, AH
+        OUT  DMA_CH1_COUNT, AL
+
+        ; ---- 6. Enable MEM-TO-MEM + CH0 + CH1 (mode = 83H) ----
+        ; 83H = DMA_MEM2MEM(80H) | DMA_CH1_EN(02H) | DMA_CH0_EN(01H)
+        MOV  AL, 083H
+        OUT  DMA_MODE_REG, AL
+
+        ; ---- 7. Simulate the on-chip DMA copy (CH0 -> CH1) ----
+        LEA  SI, SOURCE_BUF
+        LEA  DI, SCRATCH_BUF
+        MOV  CX, BLOCK_SIZE
+        CLD
+        REP  MOVSB
+
+        ; ---- 8. Verify SCRATCH_BUF == SOURCE_BUF ----
+        LEA  SI, SOURCE_BUF
+        LEA  DI, SCRATCH_BUF
+        MOV  CX, BLOCK_SIZE
+        CLD
+        REPE CMPSB
+        JNZ  M2M_FAIL
+
+        LEA  DX, MSG_M2M_OK
+        JMP  M2M_PRINT
+M2M_FAIL:
+        LEA  DX, MSG_M2M_FAIL
+M2M_PRINT:
+        MOV  AH, 09H
+        INT  21H
+        LEA  DX, MSG_NEWLINE
+        MOV  AH, 09H
+        INT  21H
+        RET
+DEMO_MEM2MEM ENDP
+
+; ===========================================================
+; VERIFY_DEST
+; Compares SOURCE_BUF and DEST_BUF byte-by-byte.
+; Returns CF=0 on match (success), CF=1 on mismatch (fail).
+; Destroys: CX, SI, DI, flags
+; ===========================================================
+VERIFY_DEST PROC NEAR
+        LEA  SI, SOURCE_BUF
+        LEA  DI, DEST_BUF
+        MOV  CX, BLOCK_SIZE
+        CLD
+        REPE CMPSB
+        JNZ  VD_FAIL
+        CLC                      ; match -> CF = 0
+        RET
+VD_FAIL:
+        STC                      ; mismatch -> CF = 1
+        RET
+VERIFY_DEST ENDP
+
+END MAIN
